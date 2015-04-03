@@ -10,6 +10,7 @@ This module contains the authentication handlers for Requests.
 import os
 import re
 import time
+import threading
 import hashlib
 
 from base64 import b64encode
@@ -17,7 +18,6 @@ from base64 import b64encode
 from .compat import urlparse, str
 from .cookies import extract_cookies_to_jar
 from .utils import parse_dict_header, to_native_string
-from .status_codes import codes
 
 CONTENT_TYPE_FORM_URLENCODED = 'application/x-www-form-urlencoded'
 CONTENT_TYPE_MULTI_PART = 'multipart/form-data'
@@ -59,23 +59,30 @@ class HTTPProxyAuth(HTTPBasicAuth):
 
 
 class HTTPDigestAuth(AuthBase):
+
     """Attaches HTTP Digest Authentication to the given Request object."""
+
     def __init__(self, username, password):
         self.username = username
         self.password = password
-        self.last_nonce = ''
-        self.nonce_count = 0
-        self.chal = {}
-        self.pos = None
-        self.num_401_calls = 1
+        self.thd = threading.local()
+
+    def initForThread(self):
+        if not hasattr(self.thd, "init"):
+            self.thd.init = True
+            self.thd.last_nonce = ''
+            self.thd.nonce_count = 0
+            self.thd.chal = {}
+            self.thd.pos = None
+            self.thd.num_401_calls = 0
 
     def build_digest_header(self, method, url):
 
-        realm = self.chal['realm']
-        nonce = self.chal['nonce']
-        qop = self.chal.get('qop')
-        algorithm = self.chal.get('algorithm')
-        opaque = self.chal.get('opaque')
+        realm = self.thd.chal['realm']
+        nonce = self.thd.chal['nonce']
+        qop = self.thd.chal.get('qop')
+        algorithm = self.thd.chal.get('algorithm')
+        opaque = self.thd.chal.get('opaque')
 
         if algorithm is None:
             _algorithm = 'MD5'
@@ -113,12 +120,12 @@ class HTTPDigestAuth(AuthBase):
         HA1 = hash_utf8(A1)
         HA2 = hash_utf8(A2)
 
-        if nonce == self.last_nonce:
-            self.nonce_count += 1
+        if nonce == self.thd.last_nonce:
+            self.thd.nonce_count += 1
         else:
-            self.nonce_count = 1
-        ncvalue = '%08x' % self.nonce_count
-        s = str(self.nonce_count).encode('utf-8')
+            self.thd.nonce_count = 1
+        ncvalue = '%08x' % self.thd.nonce_count
+        s = str(self.thd.nonce_count).encode('utf-8')
         s += nonce.encode('utf-8')
         s += time.ctime().encode('utf-8')
         s += os.urandom(8)
@@ -132,13 +139,13 @@ class HTTPDigestAuth(AuthBase):
         elif qop == 'auth' or 'auth' in qop.split(','):
             noncebit = "%s:%s:%s:%s:%s" % (
                 nonce, ncvalue, cnonce, 'auth', HA2
-                )
+            )
             respdig = KD(HA1, noncebit)
         else:
             # XXX handle auth-int.
             return None
 
-        self.last_nonce = nonce
+        self.thd.last_nonce = nonce
 
         # XXX should the partial digests be encoded too?
         base = 'username="%s", realm="%s", nonce="%s", uri="%s", ' \
@@ -157,23 +164,23 @@ class HTTPDigestAuth(AuthBase):
     def handle_redirect(self, r, **kwargs):
         """Reset num_401_calls counter on redirects."""
         if r.is_redirect:
-            self.num_401_calls = 1
+            self.thd.num_401_calls = 1
 
     def handle_401(self, r, **kwargs):
         """Takes the given response and tries digest-auth, if needed."""
 
-        if self.pos is not None:
+        if self.thd.pos is not None:
             # Rewind the file position indicator of the body to where
             # it was to resend the request.
-            r.request.body.seek(self.pos)
-        num_401_calls = getattr(self, 'num_401_calls', 1)
+            r.request.body.seek(self.thd.pos)
+        num_401_calls = self.thd.num_401_calls
         s_auth = r.headers.get('www-authenticate', '')
 
         if 'digest' in s_auth.lower() and num_401_calls < 2:
 
-            self.num_401_calls += 1
+            self.thd.num_401_calls += 1
             pat = re.compile(r'digest ', flags=re.IGNORECASE)
-            self.chal = parse_dict_header(pat.sub('', s_auth, count=1))
+            self.thd.chal = parse_dict_header(pat.sub('', s_auth, count=1))
 
             # Consume content and release the original connection
             # to allow our new request to reuse the same one.
@@ -191,21 +198,24 @@ class HTTPDigestAuth(AuthBase):
 
             return _r
 
-        self.num_401_calls = 1
+        self.thd.num_401_calls = 1
         return r
 
     def __call__(self, r):
+        self.initForThread()
         # If we have a saved nonce, skip the 401
-        if self.last_nonce:
+        if self.thd.last_nonce:
             r.headers['Authorization'] = self.build_digest_header(r.method, r.url)
         try:
-            self.pos = r.body.tell()
+            self.thd.pos = r.body.tell()
         except AttributeError:
             # In the case of HTTPDigestAuth being reused and the body of
             # the previous request was a file-like object, pos has the
             # file position of the previous body. Ensure it's set to
             # None.
-            self.pos = None
+            self.thd.pos = None
         r.register_hook('response', self.handle_401)
         r.register_hook('response', self.handle_redirect)
+        self.thd.num_401_calls = 1
+
         return r
